@@ -457,13 +457,149 @@ async function connectSftp(site: RemoteSiteRecord): Promise<ConnectResult> {
   return connected
 }
 
-async function withSiteSftp<T>(site: RemoteSiteRecord, fn: (sftp: SFTPWrapper) => Promise<T>): Promise<T> {
-  const connection = await connectSftp(site)
-  try {
-    return await fn(connection.sftp)
-  } finally {
-    try { connection.sftp.end() } catch { /* ignore */ }
-    try { connection.client.end() } catch { /* ignore */ }
+/** 池化后的 SSH/SFTP 连接（阶段一：长连接复用）。 */
+interface PooledConn {
+  siteId: string
+  client: Client
+  sftp: SFTPWrapper
+  /** 是否常驻池（否则为高并发下的一次性临时连接）。 */
+  pooled: boolean
+  inUse: boolean
+  dead: boolean
+  createdAt: number
+  lastUsed: number
+}
+
+/**
+ * 每站点一个长连接池：
+ *  - 懒连接 + keepalive（ssh2 配置里已含 keepaliveInterval）
+ *  - 复用空闲连接，避免每个工具调用都重新握手
+ *  - 并发超过上限时退化为临时连接，不阻塞请求
+ *  - 空闲超过 TTL 或连接断开时清理/自动重连
+ */
+class SftpConnectionPool {
+  private pools = new Map<string, PooledConn[]>()
+  private maxPerSite: number
+  private idleTtlMs: number
+  private timer: NodeJS.Timeout | undefined
+
+  constructor(maxPerSite = 2, idleTtlMs = 5 * 60 * 1000) {
+    this.maxPerSite = maxPerSite
+    this.idleTtlMs = idleTtlMs
+    const timer = setInterval(() => this.prune(), 60_000)
+    if (typeof timer.unref === 'function') timer.unref()
+    this.timer = timer
+  }
+
+  dispose(): void {
+    if (this.timer) clearInterval(this.timer)
+    this.timer = undefined
+    for (const list of this.pools.values()) for (const conn of [...list]) this.end(conn)
+    this.pools.clear()
+  }
+
+  async acquire(site: RemoteSiteRecord): Promise<PooledConn> {
+    let list = this.pools.get(site.id)
+    if (!list) {
+      list = []
+      this.pools.set(site.id, list)
+    }
+    const reuse = list.find((conn) => !conn.inUse && !conn.dead)
+    if (reuse) {
+      reuse.inUse = true
+      reuse.lastUsed = Date.now()
+      return reuse
+    }
+    const pooled = list.length < this.maxPerSite
+    const conn = await this.open(site, pooled)
+    if (pooled) list.push(conn) // pooled=false 时该连接是一次性临时连接，不放进池
+    conn.inUse = true
+    return conn
+  }
+
+  release(conn: PooledConn): void {
+    conn.inUse = false
+    conn.lastUsed = Date.now()
+    if (!conn.pooled || conn.dead) {
+      this.remove(conn)
+      this.end(conn)
+    }
+  }
+
+  stats(): Record<string, { active: number; idle: number; total: number }> {
+    const out: Record<string, { active: number; idle: number; total: number }> = {}
+    for (const [siteId, list] of this.pools) {
+      out[siteId] = {
+        active: list.filter((conn) => conn.inUse && !conn.dead).length,
+        idle: list.filter((conn) => !conn.inUse && !conn.dead).length,
+        total: list.length,
+      }
+    }
+    return out
+  }
+
+  /** 站点被删除或连接信息变化时，立即关闭该站点的所有池连接。 */
+  closeSite(siteId: string): void {
+    const list = this.pools.get(siteId)
+    if (!list) return
+    for (const conn of [...list]) {
+      conn.inUse = false
+      conn.dead = true
+      this.end(conn)
+    }
+    this.pools.delete(siteId)
+  }
+
+  private async open(site: RemoteSiteRecord, pooled: boolean): Promise<PooledConn> {
+    const result = await connectSftp(site)
+    const conn: PooledConn = {
+      siteId: site.id,
+      client: result.client,
+      sftp: result.sftp,
+      pooled,
+      inUse: false,
+      dead: false,
+      createdAt: Date.now(),
+      lastUsed: Date.now(),
+    }
+    const markDead = () => {
+      conn.dead = true
+    }
+    conn.client.on('close', markDead)
+    conn.client.on('error', markDead)
+    return conn
+  }
+
+  private remove(conn: PooledConn): void {
+    const list = this.pools.get(conn.siteId)
+    if (!list) return
+    const at = list.indexOf(conn)
+    if (at !== -1) list.splice(at, 1)
+    if (list.length === 0) this.pools.delete(conn.siteId)
+  }
+
+  private end(conn: PooledConn): void {
+    try { conn.sftp.end() } catch { /* ignore */ }
+    try { conn.client.end() } catch { /* ignore */ }
+  }
+
+  private prune(): void {
+    const now = Date.now()
+    for (const [siteId, list] of this.pools) {
+      const kept = list.filter((conn) => {
+        if (conn.dead) {
+          this.end(conn)
+          return false
+        }
+        if (!conn.inUse && now - conn.lastUsed > this.idleTtlMs) {
+          this.end(conn)
+          return false
+        }
+        return true
+      })
+      if (kept.length > 0) this.pools.set(siteId, kept)
+      else this.pools.delete(siteId)
+    }
   }
 }
 
@@ -555,6 +691,28 @@ async function sftpWrite(sftp: SFTPWrapper, path: string, content: Buffer): Prom
   })
 }
 
+async function sftpAppend(sftp: SFTPWrapper, path: string, content: Buffer): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    sftp.appendFile(path, content, (error) => (error ? reject(error) : resolve()))
+  })
+}
+
+/** 按 offset 部分覆盖写（随机访问，不需要重新上传整个文件）。 */
+async function sftpWriteAt(sftp: SFTPWrapper, path: string, offset: number, content: Buffer): Promise<void> {
+  const handle = await new Promise<Buffer>((resolve, reject) => {
+    sftp.open(path, 'r+', (error, handle) => (error ? reject(error) : resolve(handle)))
+  })
+  try {
+    await new Promise<void>((resolve, reject) => {
+      sftp.write(handle, content, 0, content.length, offset, (error) => (error ? reject(error) : resolve()))
+    })
+  } finally {
+    await new Promise<void>((resolve) => {
+      sftp.close(handle, () => resolve())
+    })
+  }
+}
+
 /* ------------------------------------------------------------------ */
 /* 服务                                                                */
 /* ------------------------------------------------------------------ */
@@ -587,9 +745,32 @@ class RemoteService {
   private ctx: AppContext
   private store: StorageShape = loadStore()
   private mutationTail: Promise<void> = Promise.resolve()
+  private pool = new SftpConnectionPool()
+  private fileCache = new Map<string, {
+    path: string
+    size: number
+    mtime: number
+    encoding: 'utf8' | 'base64'
+    content: string
+  }>()
 
   constructor(ctx: AppContext) {
     this.ctx = ctx
+  }
+
+  /** 复用连接池执行一次需要 SFTP 通道的操作：常驻连接优先，忙碌时开临时连接。 */
+  private async withPooledSftp<T>(site: RemoteSiteRecord, fn: (sftp: SFTPWrapper) => Promise<T>): Promise<T> {
+    const conn = await this.pool.acquire(site)
+    try {
+      return await fn(conn.sftp)
+    } finally {
+      this.pool.release(conn)
+    }
+  }
+
+  dispose(): void {
+    this.pool.dispose()
+    this.fileCache.clear()
   }
 
   private mutate<T>(fn: () => T | Promise<T>): Promise<T> {
@@ -713,6 +894,7 @@ class RemoteService {
       if (at === -1) throw new Error(`remote site '${id}' not found`)
       this.store.sites[at] = { ...next, updatedAt: nowIso() }
     })
+    if (connectionChanged) this.pool.closeSite(id)
     const currentSite = this.getSite(id)
     if (input.name !== undefined && input.name.trim() !== site.name) {
       await this.renameSite(id, input.name.trim())
@@ -736,6 +918,7 @@ class RemoteService {
       this.store.workspaces = this.store.workspaces.filter((workspace) => workspace.siteId !== id)
       this.store.sites = this.store.sites.filter((site) => site.id !== id)
     })
+    this.pool.closeSite(id)
     for (const workspace of workspaces) await this.detachLocalWorkspace(workspace)
     return true
   }
@@ -743,7 +926,7 @@ class RemoteService {
   async browseSite(id: string, path?: string): Promise<{ path: string; entries: SftpEntry[] }> {
     const site = this.getSite(id)
     const target = posixNormalize(path?.trim() || site.homePath)
-    return withSiteSftp(site, async (sftp) => {
+    return this.withPooledSftp(site, async (sftp) => {
       const stats = await sftpStat(sftp, target)
       if (!stats.isDirectory()) throw new Error(`'${target}' is not a directory`)
       return { path: target, entries: await sftpList(sftp, target) }
@@ -755,7 +938,7 @@ class RemoteService {
     const clean = name.trim()
     if (!clean) throw new Error('folder name must not be empty')
     const target = posixNormalize(posix.join(parentPath, clean))
-    return withSiteSftp(site, async (sftp) => {
+    return this.withPooledSftp(site, async (sftp) => {
       await sftpMkdir(sftp, target)
       return target
     })
@@ -788,7 +971,7 @@ class RemoteService {
     const rootPath = input.rootPath?.trim()
       ? posixNormalize(input.rootPath)
       : site.homePath
-    await withSiteSftp(site, async (sftp) => {
+    await this.withPooledSftp(site, async (sftp) => {
       const stats = await sftpStat(sftp, rootPath)
       if (!stats.isDirectory()) throw new Error(`remote root '${rootPath}' is not a directory`)
     })
@@ -839,7 +1022,7 @@ class RemoteService {
 
   async testWorkspace(id: string): Promise<RemoteWorkspaceView> {
     const { workspace, site } = this.getWorkspace(id)
-    await withSiteSftp(site, async (sftp) => {
+    await this.withPooledSftp(site, async (sftp) => {
       const stats = await sftpStat(sftp, workspace.rootPath)
       if (!stats.isDirectory()) throw new Error(`remote root '${workspace.rootPath}' is not a directory`)
     })
@@ -849,7 +1032,7 @@ class RemoteService {
   browseWorkspace(id: string, relPath?: string): Promise<{ path: string; entries: SftpEntry[] }> {
     const { workspace, site } = this.getWorkspace(id)
     const path = resolveRemotePath(workspace.rootPath, relPath)
-    return withSiteSftp(site, async (sftp) => {
+    return this.withPooledSftp(site, async (sftp) => {
       const stats = await sftpStat(sftp, path)
       if (!stats.isDirectory()) throw new Error(`'${path}' is not a directory`)
       return { path, entries: await sftpList(sftp, path) }
@@ -864,13 +1047,25 @@ class RemoteService {
     const { workspace, site } = this.getWorkspace(id)
     const path = resolveRemotePath(workspace.rootPath, relPath)
     if (maxBytes > MAX_BODY_BYTES) maxBytes = MAX_BODY_BYTES
-    return withSiteSftp(site, async (sftp) => {
+    const cacheKey = this.fileCacheKey(site.id, workspace.rootPath, path)
+    return this.withPooledSftp(site, async (sftp) => {
       const stats = await sftpStat(sftp, path)
       if (!stats.isFile()) throw new Error(`'${path}' is not a file`)
       if (stats.size > maxBytes) {
         throw new Error(`file is ${stats.size} bytes, exceeds maxBytes=${maxBytes}`)
       }
+      const cached = this.fileCache.get(cacheKey)
+      if (cached && cached.size === stats.size && cached.mtime === stats.mtime) {
+        return { path, size: cached.size, encoding: cached.encoding, content: cached.content }
+      }
       const result = await sftpReadText(sftp, path, maxBytes)
+      this.fileCache.set(cacheKey, {
+        path,
+        size: stats.size,
+        mtime: stats.mtime,
+        encoding: result.encoding,
+        content: result.content,
+      })
       return { path, size: result.size, encoding: result.encoding, content: result.content }
     })
   }
@@ -887,10 +1082,61 @@ class RemoteService {
     if (buffer.length > MAX_BODY_BYTES) {
       throw new Error(`content is ${buffer.length} bytes, exceeds ${MAX_BODY_BYTES}`)
     }
-    return withSiteSftp(site, async (sftp) => {
+    return this.withPooledSftp(site, async (sftp) => {
       await sftpWrite(sftp, path, buffer)
+      this.fileCache.delete(this.fileCacheKey(site.id, workspace.rootPath, path))
       return { path, bytes: buffer.length }
     })
+  }
+
+  /** 追加写：不需要下载/覆盖整个文件。 */
+  appendWorkspace(
+    id: string,
+    relPath: string,
+    content: string,
+    encoding: 'utf8' | 'base64' = 'utf8',
+  ): Promise<{ path: string; bytes: number }> {
+    const { workspace, site } = this.getWorkspace(id)
+    const path = resolveRemotePath(workspace.rootPath, relPath)
+    const buffer = Buffer.from(content, encoding === 'base64' ? 'base64' : 'utf8')
+    if (buffer.length > MAX_BODY_BYTES) {
+      throw new Error(`content is ${buffer.length} bytes, exceeds ${MAX_BODY_BYTES}`)
+    }
+    return this.withPooledSftp(site, async (sftp) => {
+      await sftpAppend(sftp, path, buffer)
+      this.fileCache.delete(this.fileCacheKey(site.id, workspace.rootPath, path))
+      return { path, bytes: buffer.length }
+    })
+  }
+
+  /** 按字节偏移部分写入（只改一段，不重传整个文件）。 */
+  writeAtWorkspace(
+    id: string,
+    relPath: string,
+    content: string,
+    offset: number,
+    encoding: 'utf8' | 'base64' = 'utf8',
+  ): Promise<{ path: string; bytes: number }> {
+    const { workspace, site } = this.getWorkspace(id)
+    const path = resolveRemotePath(workspace.rootPath, relPath)
+    const buffer = Buffer.from(content, encoding === 'base64' ? 'base64' : 'utf8')
+    if (buffer.length > MAX_BODY_BYTES) {
+      throw new Error(`content is ${buffer.length} bytes, exceeds ${MAX_BODY_BYTES}`)
+    }
+    if (!Number.isInteger(offset) || offset < 0) throw new Error('offset must be a non-negative integer')
+    return this.withPooledSftp(site, async (sftp) => {
+      await sftpWriteAt(sftp, path, offset, buffer)
+      this.fileCache.delete(this.fileCacheKey(site.id, workspace.rootPath, path))
+      return { path, bytes: buffer.length }
+    })
+  }
+
+  private fileCacheKey(siteId: string, rootPath: string, path: string): string {
+    return `${siteId}:${rootPath}:${path}`
+  }
+
+  poolStats(): { pools: Record<string, { active: number; idle: number; total: number }>; cacheEntries: number } {
+    return { pools: this.pool.stats(), cacheEntries: this.fileCache.size }
   }
 
   /* --------------------- local anchor bridges --------------------- */
@@ -1197,6 +1443,37 @@ export function apply(ctx: AppContext): void {
           return
         }
 
+        if (pathname === `${API_PREFIX}/workspaces/append` && method === 'POST') {
+          const body = (await readJsonBody(req)) as Record<string, unknown>
+          const value = await service.appendWorkspace(
+            requireString(body.id, 'id'),
+            requireString(body.path, 'path'),
+            requireString(body.content, 'content', ''),
+            body.encoding === 'base64' ? 'base64' : 'utf8',
+          )
+          sendJson(res, 200, { ok: true, value })
+          return
+        }
+
+        if (pathname === `${API_PREFIX}/workspaces/writeat` && method === 'POST') {
+          const body = (await readJsonBody(req)) as Record<string, unknown>
+          const offset = Number(body.offset)
+          const value = await service.writeAtWorkspace(
+            requireString(body.id, 'id'),
+            requireString(body.path, 'path'),
+            requireString(body.content, 'content', ''),
+            Number.isFinite(offset) ? offset : 0,
+            body.encoding === 'base64' ? 'base64' : 'utf8',
+          )
+          sendJson(res, 200, { ok: true, value })
+          return
+        }
+
+        if (pathname === `${API_PREFIX}/pool-stats` && method === 'GET') {
+          sendJson(res, 200, { ok: true, value: service.poolStats() })
+          return
+        }
+
         sendJson(res, 404, apiError(new Error(`unknown remote-workspace API route: ${method} ${pathname}`), 'not-found'))
       } catch (error) {
         sendJson(res, 500, apiError(error))
@@ -1389,6 +1666,42 @@ export function apply(ctx: AppContext): void {
     ))
 
     disposers.push(register(
+      'remote_workspace_append',
+      '向远程工作区的文件追加内容（不需要下载/覆盖整个文件）。encoding 默认 utf8，可选 base64。',
+      {
+        id: { type: 'string', required: true, description: '远程工作区 id' },
+        path: { type: 'string', required: true, description: '远程文件绝对路径' },
+        content: { type: 'string', required: true, description: '要追加的内容' },
+        encoding: { type: 'string', enum: ['utf8', 'base64'], description: '内容编码，默认 utf8' },
+      },
+      async (args: any) => JSON.stringify(await service.appendWorkspace(
+        String(args.id),
+        String(args.path),
+        String(args.content),
+        args.encoding === 'base64' ? 'base64' : 'utf8',
+      ), null, 2),
+    ))
+
+    disposers.push(register(
+      'remote_workspace_write_at',
+      '按字节偏移部分写入远程文件（只改文件中的一段，不重传整个文件）。offset 为字节位置。',
+      {
+        id: { type: 'string', required: true, description: '远程工作区 id' },
+        path: { type: 'string', required: true, description: '远程文件绝对路径' },
+        content: { type: 'string', required: true, description: '要写入的内容' },
+        offset: { type: 'number', required: true, description: '字节偏移位置' },
+        encoding: { type: 'string', enum: ['utf8', 'base64'], description: '内容编码，默认 utf8' },
+      },
+      async (args: any) => JSON.stringify(await service.writeAtWorkspace(
+        String(args.id),
+        String(args.path),
+        String(args.content),
+        Number(args.offset ?? 0),
+        args.encoding === 'base64' ? 'base64' : 'utf8',
+      ), null, 2),
+    ))
+
+    disposers.push(register(
       'remote_workspace_test',
       '测试一个远程工作区的根目录可达性。',
       {
@@ -1411,6 +1724,9 @@ export function apply(ctx: AppContext): void {
 
     return disposers
   }, '@dsh-external/dsh-remote-workspace: tools')
+
+  // 插件卸载/热重载时关闭连接池与缓存
+  ctx.effect(() => () => service.dispose(), '@dsh-external/dsh-remote-workspace: pool dispose')
 
   ctx.logger?.info?.('[remote-workspace] plugin ready')
 }
