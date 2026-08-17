@@ -13,7 +13,7 @@
  *  4. 经 ctx.webServer 暴露 HTTP API（/remote-workspaces/api/*），供客户端面板调用
  *  5. 向 agent 注册 remote_site_* / remote_workspace_* 工具
  */
-import type { Context } from 'cordis'
+import type { Context } from '@deepseek-ai/cordis'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { createHash, randomUUID } from 'node:crypto'
 import {
