@@ -25,7 +25,7 @@ if (!client.includes('window.__ModuleLoader__.load')) {
 if (!client.includes('@dsh-external/dsh-remote-workspace')) {
   throw new Error('client bundle is missing the plugin id')
 }
-for (const route of ['/sites/list', '/workspaces/add']) {
+for (const route of ['sites/list', 'workspaces/add']) {
   if (!client.includes(route)) throw new Error(`client bundle is missing API route '${route}'`)
 }
 
