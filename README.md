@@ -51,23 +51,41 @@ A plugin for **DSH** that brings SSH/SFTP remote workspaces into the workspace s
 
 ## Install
 
-### Option A — from a GitHub Release (recommended)
+The package declares a `dsh.bundle` manifest, so it is installable through
+DSH's plugin command and by plugin storefronts such as
+[dsh-market](https://github.com/dsh-market/dsh-market).
 
-1. Download `dsh-external-dsh-remote-workspace-0.0.1.tgz` from the [Releases](../../releases) page.
-2. Extract it and inject it from your DSH injector environment:
+### Option A — GitHub Release tarball (recommended)
+
+1. Download `dsh-external-dsh-remote-workspace-0.0.1.tgz` from the
+   [Releases](../../releases/latest) page.
+2. Extract and prepare it:
 
    ```bash
-   mkdir -p ~/dsh-plugins && tar -xzf dsh-external-dsh-remote-workspace-0.0.1.tgz -C ~/dsh-plugins
-   # In a DSH session with the plugin production line available:
+   mkdir -p ~/dsh-plugins
+   tar -xzf dsh-external-dsh-remote-workspace-0.0.1.tgz -C ~/dsh-plugins
+   bash ~/dsh-plugins/package/install.sh   # installs ssh2 and validates artifacts
+   ```
+
+3. Inject it from your DSH session:
+
+   ```bash
+   # DSH injector environment:
    #   dev_inject_plugin ~/dsh-plugins/package
    ```
 
-   > The package depends on [`ssh2`](https://www.npmjs.com/package/ssh2). Install it into
-   > the extracted package before injecting: `cd ~/dsh-plugins/package && npm install --omit=dev ssh2`
+4. Refresh the DSH web page.
 
-3. Refresh the DSH web page.
+### Option B — DSH plugin manager
 
-### Option B — build from source
+The repo ships `dsh.bundle.patch` + `cordis.patch.yml`, so a DSH install that
+supports bundle installation can add it directly:
+
+```bash
+dsh plugin --profile web add Hefulalala/dsh-remote-workspace
+```
+
+### Option C — build from source
 
 ```bash
 git clone https://github.com/Hefulalala/dsh-remote-workspace.git dsh-remote-workspace
@@ -186,10 +204,16 @@ Version 1 stores are migrated automatically on first load.
 ## Development
 
 ```
-src/index.ts          Host: data model, SSH2/SFTP, workspaceRegistry anchors, HTTP API, tools
-src/client/index.tsx  Client: Remote Sites panel + unified add-workspace flow
-lib/                  Build output
+src/index.ts             Host: data model, SSH2/SFTP, workspaceRegistry anchors, HTTP API, tools
+src/client/index.tsx     Client: Remote Sites panel + unified add-workspace flow
+cordis.patch.yml         dsh.bundle patch used by `dsh plugin add`
+scripts/build.sh         Host build
+scripts/smoke.mjs        Artifact smoke test
+lib/                     Build output
 ```
+
+More design details: [docs/architecture.md](docs/architecture.md) ·
+[CHANGELOG.md](CHANGELOG.md).
 
 - Host services required: `webServer`, `tools`, `workspaceRegistry`
 - Client services required: `slots`, `workspaces`
