@@ -1,26 +1,28 @@
 #!/usr/bin/env node
 // Smoke test for built artifacts. Run after `bash scripts/build.sh && npm run build:client`.
+// This is a textual artifact check only: it must not import the host module at
+// runtime, because the host's framework peers are supplied by the DSH harness,
+// not by this package's standalone npm install (CI uses --legacy-peer-deps).
 import { readFileSync } from 'node:fs'
-import { createRequire } from 'node:module'
 
-const require = createRequire(import.meta.url)
 const root = new URL('..', import.meta.url)
 
-const host = await import(new URL('lib/index.js', root))
-if (host.name !== '@dsh-external/dsh-remote-workspace') {
-  throw new Error(`unexpected plugin name: ${host.name}`)
-}
-for (const service of ['webServer', 'tools', 'workspaceRegistry']) {
-  if (!host.inject.includes(service)) {
-    throw new Error(`host inject list is missing '${service}': ${host.inject.join(',')}`)
-  }
-}
-if (typeof host.apply !== 'function') throw new Error('host apply is missing')
+const hostPath = new URL('lib/index.js', root)
+const host = readFileSync(hostPath, 'utf8')
 
-const hostSrc = readFileSync(new URL('lib/index.js', root), 'utf8')
-for (const route of ['/workspaces/append', '/workspaces/writeat', '/pool-stats']) {
-  if (!hostSrc.includes(route)) throw new Error(`host bundle is missing API route '${route}'`)
+for (const needle of [
+  '@dsh-external/dsh-remote-workspace',
+  'workspaceRegistry',
+  'webServer',
+  'remote-workspaces/api',
+  '/workspaces/append',
+  '/workspaces/writeat',
+  '/pool-stats',
+]) {
+  if (!host.includes(needle)) throw new Error(`host bundle is missing '${needle}'`)
 }
+if (!/export\s+const\s+name\s*=/.test(host)) throw new Error('host bundle is missing the plugin name export')
+if (!/export\s+function\s+apply/.test(host)) throw new Error('host bundle is missing apply()')
 
 const clientPath = new URL('lib/client.js', root)
 const client = readFileSync(clientPath, 'utf8')
@@ -34,4 +36,4 @@ for (const route of ['sites/list', 'workspaces/add']) {
   if (!client.includes(route)) throw new Error(`client bundle is missing API route '${route}'`)
 }
 
-console.log(`[smoke] ok: ${host.name} inject=[${host.inject.join(', ')}]`)
+console.log('[smoke] ok: host + client artifacts look valid')
