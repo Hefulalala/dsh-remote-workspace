@@ -17,6 +17,11 @@ for (const service of ['webServer', 'tools', 'workspaceRegistry']) {
 }
 if (typeof host.apply !== 'function') throw new Error('host apply is missing')
 
+const hostSrc = readFileSync(new URL('lib/index.js', root), 'utf8')
+for (const route of ['/workspaces/append', '/workspaces/writeat', '/pool-stats']) {
+  if (!hostSrc.includes(route)) throw new Error(`host bundle is missing API route '${route}'`)
+}
+
 const clientPath = new URL('lib/client.js', root)
 const client = readFileSync(clientPath, 'utf8')
 if (!client.includes('window.__ModuleLoader__.load')) {

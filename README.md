@@ -158,6 +158,8 @@ The agent resolves paths against the remote root and uses `remote_workspace_read
 | `remote_workspace_browse` | Browse a workspace directory |
 | `remote_workspace_read` | Read a remote file (binary → base64) |
 | `remote_workspace_write` | Overwrite a remote file (utf8/base64) |
+| `remote_workspace_append` | Append to a remote file (no whole-file rewrite) |
+| `remote_workspace_write_at` | Patch part of a remote file at a byte offset |
 | `remote_workspace_test` | Test a workspace root |
 | `remote_workspace_remove` | Remove the sidebar grouping only |
 
@@ -185,8 +187,11 @@ Prefix: `/remote-workspaces/api` — every response is `{ok:true,value}` or `{ok
 | POST | `/workspaces/remove` | Remove workspace |
 | POST | `/workspaces/test` | Test workspace root |
 | POST | `/workspaces/browse` | Browse workspace directory |
-| POST | `/workspaces/read` | Read file |
+| POST | `/workspaces/read` | Read file (cached by `mtime+size`) |
 | POST | `/workspaces/write` | Write file |
+| POST | `/workspaces/append` | Append to a file |
+| POST | `/workspaces/writeat` | Patch part of a file at a byte offset |
+| GET  | `/pool-stats` | Connection-pool and file-cache stats |
 
 ---
 
@@ -223,8 +228,8 @@ More design details: [docs/architecture.md](docs/architecture.md) ·
 ## Known limitations
 
 - Remote file editing happens through the agent tools; the site panel itself only manages connections
+- Connections are **pooled** per site (idle TTL + auto-reconnect); hot-path file ops also get an `mtime+size` content cache
 - No remote rename/delete, directory sync, or conflict handling yet
-- Connections are opened per request (no connection pool yet)
 - Passwords are stored in plain text (see Security notes)
 
 ## License

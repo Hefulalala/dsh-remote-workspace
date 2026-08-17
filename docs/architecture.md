@@ -45,9 +45,13 @@ Responsibilities:
 
 1. **Storage** — load/migrate/save the JSON store through an atomic
    tmp-file + rename, serialized by a mutation queue.
-2. **SSH/SFTP** — uses `ssh2`. Connections are opened per request.
-   `prepareSiteConnection` resolves the remote home with `sftp.realpath('.')`
-   and canonicalizes an explicitly configured home path.
+2. **SSH/SFTP** — uses `ssh2` behind a per-site **connection pool**
+   (`SftpConnectionPool`): lazy connect, keepalive, idle TTL, auto-reconnect,
+   and a limited number of persistent connections per site (concurrency spikes
+   degrade to one-off connections instead of blocking). Hot-path file reads are
+   cached by `mtime + size`, and appends / byte-offset writes avoid whole-file
+   rewrites. `prepareSiteConnection` resolves the remote home with
+   `sftp.realpath('.')` and canonicalizes an explicitly configured home path.
 3. **Sidebar integration** — for every remote workspace, `ensureLocalWorkspace`
    creates `$DSH_HOME/remote-workspaces/<workspaceId>/`, writes `AGENTS.md`,
    and registers the directory with DSH's `workspaceRegistry` under the

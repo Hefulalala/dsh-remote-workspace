@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] - stage 1 (connection pooling + cache)
+
+### Changed
+
+- SSH/SFTP connections are now **pooled per site** instead of opened per request:
+  lazy connect, keepalive, idle TTL, auto-reconnect, bounded concurrency.
+- Remote file reads are **cached by `mtime + size`**; writes, appends and
+  byte-offset writes invalidate the cache automatically.
+
+### Added
+
+- `remote_workspace_append` tool + `/workspaces/append` endpoint (no whole-file rewrite).
+- `remote_workspace_write_at` tool + `/workspaces/writeat` endpoint (byte-offset patch).
+- `/pool-stats` endpoint for connection-pool and file-cache introspection.
+- Pooled connections are closed when a site is removed or its connection info changes.
+
 ## [0.0.1] - 2026-08-17
 
 ### Added
