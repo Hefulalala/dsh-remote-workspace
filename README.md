@@ -59,13 +59,13 @@ DSH's plugin command and by plugin storefronts such as
 
 ### Option A — GitHub Release tarball (recommended)
 
-1. Download `dsh-external-dsh-remote-workspace-0.0.1.tgz` from the
+1. Download `dsh-external-dsh-remote-workspace-0.1.0.tgz` from the
    [Releases](../../releases/latest) page.
 2. Extract and prepare it:
 
    ```bash
    mkdir -p ~/dsh-plugins
-   tar -xzf dsh-external-dsh-remote-workspace-0.0.1.tgz -C ~/dsh-plugins
+   tar -xzf dsh-external-dsh-remote-workspace-0.1.0.tgz -C ~/dsh-plugins
    bash ~/dsh-plugins/package/install.sh   # installs ssh2 and validates artifacts
    ```
 

@@ -1,6 +1,6 @@
 {
   "name": "@dsh-external/dsh-remote-workspace",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "description": "远程站点与远程工作区（SSH/SFTP）：连接管理、统一添加工作区、远程文件读写",
   "private": true,
   "type": "module",

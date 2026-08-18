@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] - stage 1 (connection pooling + cache)
+## [0.1.0] - 2026-08-18
 
 ### Changed
 
@@ -20,6 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `remote_workspace_write_at` tool + `/workspaces/writeat` endpoint (byte-offset patch).
 - `/pool-stats` endpoint for connection-pool and file-cache introspection.
 - Pooled connections are closed when a site is removed or its connection info changes.
+- File content cache is now bounded: LRU eviction (max 256 entries / 64 MB) with a
+  10-minute TTL; cache hits refresh recency.
+- `remote_workspace_write_at` rejects offsets beyond the current file size and
+  returns a clear error instead of undefined SFTP behavior.
 
 ## [0.0.1] - 2026-08-17
 
@@ -43,3 +47,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Root-path confinement, request size limits, and `0600`-permission persistence.
 
 [0.0.1]: https://github.com/Hefulalala/dsh-remote-workspace/releases/tag/v0.0.1
+[0.1.0]: https://github.com/Hefulalala/dsh-remote-workspace/releases/tag/v0.1.0
