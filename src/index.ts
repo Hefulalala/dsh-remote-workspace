@@ -69,6 +69,9 @@ const STORAGE_VERSION = 2
 const MAX_BODY_BYTES = 8 * 1024 * 1024
 const DEFAULT_MAX_READ_BYTES = 2 * 1024 * 1024
 const READY_TIMEOUT_MS = 12_000
+const CACHE_MAX_ENTRIES = 256
+const CACHE_MAX_BYTES = 64 * 1024 * 1024
+const CACHE_TTL_MS = 10 * 60 * 1000
 
 type AuthConfig =
   | { kind: 'password'; password: string }
@@ -752,7 +755,10 @@ class RemoteService {
     mtime: number
     encoding: 'utf8' | 'base64'
     content: string
+    lastUsed: number
+    bytes: number
   }>()
+  private cacheBytes = 0
 
   constructor(ctx: AppContext) {
     this.ctx = ctx
@@ -771,6 +777,27 @@ class RemoteService {
   dispose(): void {
     this.pool.dispose()
     this.fileCache.clear()
+    this.cacheBytes = 0
+  }
+
+  /** 写入缓存并执行 LRU/字节预算淘汰；写操作后手动失效仍走原 delete。 */
+  private storeFileCache(key: string, entry: { path: string; size: number; mtime: number; encoding: 'utf8' | 'base64'; content: string }): void {
+    const prev = this.fileCache.get(key)
+    if (prev) this.cacheBytes -= prev.bytes
+    const bytes = entry.encoding === 'base64'
+      ? Math.ceil(entry.content.length * 3 / 4)
+      : Buffer.byteLength(entry.content, 'utf8')
+    const record = { ...entry, lastUsed: Date.now(), bytes }
+    this.fileCache.delete(key)
+    this.fileCache.set(key, record)
+    this.cacheBytes += bytes
+    while (this.fileCache.size > CACHE_MAX_ENTRIES || this.cacheBytes > CACHE_MAX_BYTES) {
+      const oldestKey = this.fileCache.keys().next().value as string | undefined
+      if (oldestKey === undefined) break
+      const oldest = this.fileCache.get(oldestKey)
+      if (oldest) this.cacheBytes -= oldest.bytes
+      this.fileCache.delete(oldestKey)
+    }
   }
 
   private mutate<T>(fn: () => T | Promise<T>): Promise<T> {
@@ -1055,11 +1082,20 @@ class RemoteService {
         throw new Error(`file is ${stats.size} bytes, exceeds maxBytes=${maxBytes}`)
       }
       const cached = this.fileCache.get(cacheKey)
-      if (cached && cached.size === stats.size && cached.mtime === stats.mtime) {
+      if (
+        cached
+        && cached.size === stats.size
+        && cached.mtime === stats.mtime
+        && Date.now() - cached.lastUsed < CACHE_TTL_MS
+      ) {
+        cached.lastUsed = Date.now()
+        // 命中即提升为最新（LRU）
+        this.fileCache.delete(cacheKey)
+        this.fileCache.set(cacheKey, cached)
         return { path, size: cached.size, encoding: cached.encoding, content: cached.content }
       }
       const result = await sftpReadText(sftp, path, maxBytes)
-      this.fileCache.set(cacheKey, {
+      this.storeFileCache(cacheKey, {
         path,
         size: stats.size,
         mtime: stats.mtime,
@@ -1125,6 +1161,10 @@ class RemoteService {
     }
     if (!Number.isInteger(offset) || offset < 0) throw new Error('offset must be a non-negative integer')
     return this.withPooledSftp(site, async (sftp) => {
+      const stats = await sftpStat(sftp, path)
+      if (offset > stats.size) {
+        throw new Error(`offset ${offset} exceeds current file size ${stats.size}; use append for tail writes`)
+      }
       await sftpWriteAt(sftp, path, offset, buffer)
       this.fileCache.delete(this.fileCacheKey(site.id, workspace.rootPath, path))
       return { path, bytes: buffer.length }
@@ -1135,8 +1175,8 @@ class RemoteService {
     return `${siteId}:${rootPath}:${path}`
   }
 
-  poolStats(): { pools: Record<string, { active: number; idle: number; total: number }>; cacheEntries: number } {
-    return { pools: this.pool.stats(), cacheEntries: this.fileCache.size }
+  poolStats(): { pools: Record<string, { active: number; idle: number; total: number }>; cacheEntries: number; cacheBytes: number; cacheMaxBytes: number } {
+    return { pools: this.pool.stats(), cacheEntries: this.fileCache.size, cacheBytes: this.cacheBytes, cacheMaxBytes: CACHE_MAX_BYTES }
   }
 
   /* --------------------- local anchor bridges --------------------- */
