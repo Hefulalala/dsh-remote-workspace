@@ -6,6 +6,8 @@ A plugin for **DSH** that brings SSH/SFTP remote workspaces into the workspace s
 - **Remote workspace** = a remote site + a directory on that server. It appears in the left workspace tree exactly like a local workspace, owns its own sessions, and lets the agent read/write remote files directly.
 - **Unified "Add Workspace" flow** — the same add-workspace entry point now asks you to choose a connection first: *Local (this computer)* or one of your remote sites.
 
+[![Listed in awesome-dsh-plugin](https://img.shields.io/badge/awesome--dsh--plugin-listed%20%7C%20tools-7c5cff?style=flat-square&logo=awesome-lists&logoColor=white)](https://github.com/awesome-dsh-plugin/awesome-dsh-plugin#tools)
+
 ---
 
 ## 中文速览
